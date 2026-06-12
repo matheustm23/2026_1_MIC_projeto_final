@@ -1,0 +1,14 @@
+# Microchip Studio / Atmel Studio - artefatos de build
+[Dd]ebug/
+[Rr]elease/
+*.o
+*.d
+*.elf
+*.hex
+*.eep
+*.map
+*.lss
+*.srec
+.vs/
+*.componentinfo.xml
+*.cyclonedx.json
