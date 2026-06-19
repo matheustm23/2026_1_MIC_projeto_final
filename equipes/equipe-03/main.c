@@ -24,18 +24,35 @@ Setpoint via bot�es f�sicos (feito)
 #include <avr/interrupt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <avr/eeprom.h> //Biblioteca pra leitura e escrita na EEPROM interna
 
 //Vari�veis globais:
 uint16_t gTemperatura = 0; //Temperatura atual em �C
 uint16_t gSetpoint = 25; //Temperatura desejada em �C
 uint8_t gLampadaLigada = 0; //Flag para l�mpada (0 para desligada, 1 para ligada)
+uint16_t gLimiarAlarme = 25; //Temperatura que dispara o alarme em °C (editável via serial: AL=)
+uint8_t gAlarmeAtivo = 0; //Flag que indica se o alarme já foi enviado (evita ficar mandando toda hora)
+
+uint8_t *gEepromIndice = (uint8_t*)0; //Endereço onde fica salvo o índice atual do buffer circular
+uint8_t *gEepromHistorico = (uint8_t*)1; //Endereço inicial do vetor de histórico (ocupa 10 bytes a partir daqui)
+uint8_t gHistIndice = 0; //Índice atual do buffer circular (cópia em RAM do que está na EEPROM)
+uint16_t gUltimaTempGravada = 0xFFFF; //Guarda a última temperatura gravada, pra só escrever na EEPROM quando o valor mudar
 
 #define UART_BUFFER_SIZE 16 //Texto recebido pela uart de no m�x 16 caracteres
+#define HISTORICO_TAMANHO 10 //Quantidade de amostras guardadas no histórico circular da EEPROM
 
 //Vari�veis pra comunica��o serial:
 volatile char gUartBuffer[UART_BUFFER_SIZE]; //string que guarda os caracteres que chegam
 volatile uint8_t gUartIndex = 0; //guarda posi��o atual onde o pr�ximo caractere ser� salvo no vetor
 volatile uint8_t gComandoPronto = 0; //flag que vira 1 quando o usu�rio aperta enter no terminal
+
+//Protótipos das funções (declaradas aqui em cima pra poderem ser chamadas em qualquer ordem no arquivo)
+void uart_init(uint32_t tBaud);
+void uart_putchar(char tDado);
+void uart_print(const char *tStr);
+void processar_comando(void);
+void salvar_historico_eeprom(void);
+void enviar_historico_eeprom(void);
 
 ISR(USART_RX_vect) //Interrup��o solicitada toda vez que um caractere chega no pino RX
 {
@@ -122,9 +139,73 @@ void processar_comando(void)
 			uart_print("ERRO: setpoint fora da faixa (0-110)\r\n");
 		}
 	}
+	
+	//Verifica se o texto enviado começa exatamente com as letras "AL=" (Alarme).
+	else if (tComando[0]=='A' && tComando[1]=='L' && tComando[2]=='=')
+	{
+		uint16_t tNovoLimiar = (uint16_t)atoi(&tComando[3]);
+
+		if (tNovoLimiar <= 110)
+		{
+			gLimiarAlarme = tNovoLimiar;
+			uart_print("OK\r\n");
+		}
+		else
+		{
+			uart_print("ERRO: limiar fora da faixa (0-110)\r\n");
+		}
+	}
+	
+	//Verifica se o texto enviado é exatamente o comando "HIST" (Histórico).
+	else if (tComando[0]=='H' && tComando[1]=='I' && tComando[2]=='S' && tComando[3]=='T')
+	{
+		enviar_historico_eeprom();
+	}
 	else
 	{
 		uart_print("ERRO: comando invalido\r\n");
+	}
+}
+
+/*
+Função que salva a temperatura atual na EEPROM em formato de buffer circular.
+Só grava se a temperatura mudou desde a última gravação, pra preservar a vida
+útil da EEPROM (limite de ~100mil ciclos de escrita por byte). Quando o índice
+chega no fim do vetor, ele volta pro início (sobrescrevendo a leitura mais antiga).
+*/
+void salvar_historico_eeprom(void)
+{
+	if (gTemperatura != gUltimaTempGravada)
+	{
+		eeprom_update_byte(gEepromHistorico + gHistIndice, (uint8_t)gTemperatura);
+
+		gHistIndice++;
+		if (gHistIndice >= HISTORICO_TAMANHO)
+		gHistIndice = 0;
+
+		eeprom_update_byte(gEepromIndice, gHistIndice); //Salva o índice atualizado pra sobreviver a um reset
+
+		gUltimaTempGravada = gTemperatura;
+	}
+}
+
+/*
+Função que lê o histórico salvo na EEPROM e manda pela serial, da amostra mais
+antiga pra mais recente, na ordem correta (começando pela posição seguinte ao
+índice atual, já que ali está a gravação mais antiga do buffer circular).
+*/
+void enviar_historico_eeprom(void)
+{
+	char tMsg[16];
+	uart_print("HISTORICO:\r\n");
+
+	for (uint8_t i = 0; i < HISTORICO_TAMANHO; i++)
+	{
+		uint8_t tPos = (gHistIndice + i) % HISTORICO_TAMANHO;
+		uint8_t tValor = eeprom_read_byte(gEepromHistorico + tPos);
+
+		sprintf(tMsg, "%u: %u C\r\n", i + 1, tValor);
+		uart_print(tMsg);
 	}
 }
 
@@ -134,6 +215,7 @@ int main(void)
 	PORTC |= (1<<PORTC0) | (1<<PORTC1); //Ativa pull-up do PC0 e PC1
 
 	DDRD |= (1<<DDD5); //PD5 como sa�da (PWM que controla a potencia da lampada)
+	DDRD |= (1<<DDD7); //PD7 como saída (aciona o buzzer do alarme sonoro)
 
 	//Modo fast PWM
 	TCCR0A = (1<<COM0B1) | (1<<WGM01) | (1<<WGM00);
@@ -153,6 +235,10 @@ int main(void)
 	uart_init(9600); //inicializa uart com 9600 de baud
 
 	sei(); //habilita interrup��es globais
+	
+	gHistIndice = eeprom_read_byte(gEepromIndice); //Recupera o índice do histórico salvo na EEPROM (sobrevive a reset/desligamento)
+	if (gHistIndice >= HISTORICO_TAMANHO) //Proteção: se a EEPROM nunca foi gravada (vem com 0xFF de fábrica), zera o índice
+	gHistIndice = 0;
 
 	while (1)
 	{
@@ -161,6 +247,9 @@ int main(void)
 		
 		//Converte valor bruto do ADC (0-1023) em �C
 		gTemperatura = ((uint32_t)ADC * 1100) / 1024 / 10;
+		
+		//Salva a leitura atual no histórico da EEPROM (buffer circular de 10 posições)
+		salvar_historico_eeprom();
 
 		//Controle ON-OFF com histerese de +- 1�C
 		if (!gLampadaLigada && gTemperatura <= (gSetpoint - 1))
@@ -193,6 +282,21 @@ int main(void)
 
 			while (!(PINC & (1<<PINC1)));
 			_delay_ms(100);
+		}
+		
+		//Verifica se a temperatura passou do limiar de alarme (definido via serial com AL=) e dispara o aviso pela serial
+		if (gTemperatura > gLimiarAlarme && !gAlarmeAtivo)
+		{
+			gAlarmeAtivo = 1;
+			PORTD |= (1<<PORTD7); //Liga o buzzer
+			uart_print("ALARME: TEMP_ALTA\r\n");
+		}
+
+		if (gTemperatura <= gLimiarAlarme && gAlarmeAtivo)
+		{
+			gAlarmeAtivo = 0;
+			PORTD &= ~(1<<PORTD7); //Desliga o buzzer
+			uart_print("ALARME: TEMP_NORMALIZADA\r\n");
 		}
 
 		//String com temperatura atual e setpoint enviada pela serial
